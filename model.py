@@ -93,7 +93,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, freqs_cis=None):
+    def forward(self, x, freqs_cis=None, kv_cache=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -105,6 +105,13 @@ class CausalSelfAttention(nn.Module):
 
         if self.rope and freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+
+        if kv_cache is not None:
+            prev_k, prev_v = kv_cache
+            k = torch.cat([prev_k, k], dim=2)
+            v = torch.cat([prev_v, v], dim=2)
+        
+        new_kv_cache = (k, v)
 
         # repeat kv heads if n_kv_heads < n_head (GQA)
         if self.n_kv_heads != self.n_head:
@@ -126,7 +133,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, new_kv_cache
 
 class MLP(nn.Module):
 
@@ -160,10 +167,11 @@ class Block(nn.Module):
         self.ln_2 = norm_cls(config.n_embd, bias=config.bias) if norm_cls == LayerNorm else norm_cls(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, freqs_cis=None):
-        x = x + self.attn(self.ln_1(x), freqs_cis=freqs_cis)
+    def forward(self, x, freqs_cis=None, kv_cache=None):
+        x, new_kv_cache = self.attn(self.ln_1(x), freqs_cis=freqs_cis, kv_cache=kv_cache)
+        x = x + x # residual here
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, new_kv_cache
 
 @dataclass
 class GPTConfig:
@@ -178,6 +186,7 @@ class GPTConfig:
     swiglu: bool = False
     rope: bool = False
     n_kv_heads: int = None # None: default to n_head (Standard MHA)
+    gradient_checkpointing: bool = False
 
 class GPT(nn.Module):
 
@@ -236,11 +245,19 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_caches=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        
+        if kv_caches is not None:
+            # if we have a cache, we only forward the last token
+            idx = idx[:, -1:]
+            t_orig = t
+            t = 1
+            pos = torch.tensor([t_orig - 1], dtype=torch.long, device=device)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -254,12 +271,21 @@ class GPT(nn.Module):
         # compute freqs_cis if using rope
         freqs_cis = None
         if self.config.rope:
-            if self.freqs_cis is None or self.freqs_cis.shape[0] < t:
-                self.freqs_cis = precompute_freqs_cis(self.config.n_embd // self.config.n_head, t).to(device)
+            if self.freqs_cis is None or self.freqs_cis.shape[0] < (pos.max() + 1):
+                self.freqs_cis = precompute_freqs_cis(self.config.n_embd // self.config.n_head, int(pos.max() + 1)).to(device)
             freqs_cis = self.freqs_cis[pos]
 
-        for block in self.transformer.h:
-            x = block(x, freqs_cis=freqs_cis)
+        new_kv_caches = []
+        for i, block in enumerate(self.transformer.h):
+            kv_cache = kv_caches[i] if kv_caches is not None else None
+            
+            if self.training and self.config.gradient_checkpointing:
+                from torch.utils.checkpoint import checkpoint
+                x, new_kv_cache = checkpoint(block, x, freqs_cis, kv_cache, use_reentrant=False)
+            else:
+                x, new_kv_cache = block(x, freqs_cis=freqs_cis, kv_cache=kv_cache)
+                
+            new_kv_caches.append(new_kv_cache)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -271,7 +297,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, new_kv_caches
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -390,11 +416,12 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        kv_caches = None
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, kv_caches = self(idx_cond, kv_caches=kv_caches)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
