@@ -66,6 +66,9 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+# onecycle scheduler settings
+use_onecycle = False # if True, use OneCycleLR instead of custom cosine decay
+onecycle_pct_start = 0.3 # percentage of training to warm up
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -201,6 +204,12 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
+# onecycle scheduler
+if use_onecycle:
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate, total_steps=max_iters, pct_start=onecycle_pct_start)
+else:
+    scheduler = None
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -255,9 +264,12 @@ running_mfu = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    if use_onecycle:
+        lr = optimizer.param_groups[0]['lr']
+    else:
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -312,6 +324,8 @@ while True:
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    if use_onecycle:
+        scheduler.step()
 
     # timing and logging
     t1 = time.time()

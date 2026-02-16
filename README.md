@@ -14,7 +14,20 @@ The simplest, fastest repository for training/finetuning medium-sized GPTs. It i
 
 ![repro124m](assets/gpt2_124M_loss.png)
 
-Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints (e.g. biggest one currently available as a starting point would be the GPT-2 1.3B model from OpenAI).
+Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints.
+
+## modern features
+
+This repository has been enhanced with several modern transformer architecture features:
+
+- **Rotary Positional Embeddings (RoPE)**: Relative positional encoding that generalizes well to longer sequences.
+- **Grouped-Query Attention (GQA)**: A balance between Multi-Head and Multi-Query Attention for better efficiency/quality.
+- **Multi-Query Attention (MQA)**: Optional support for setting `n_kv_heads=1`.
+- **RMSNorm**: A faster, scale-invariant alternative to standard LayerNorm.
+- **SwiGLU Activation**: Gated linear unit using SiLU, as popularized by LLaMA and PaLM.
+- **KV Caching**: Supports $O(N)$ inference complexity by caching key-value pairs.
+- **Gradient Checkpointing**: Drastically reduces memory usage during training at the cost of slight recomputation.
+- **OneCycleLR**: Modern learning rate scheduler for faster convergence.
 
 ## install
 
@@ -214,7 +227,6 @@ Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started
 - Eval zero-shot perplexities on standard evals (e.g. LAMBADA? HELM? etc.)
 - Finetune the finetuning script, I think the hyperparams are not great
 - Schedule for linear batch size increase during training
-- Incorporate other embeddings (rotary, alibi)
 - Separate out the optim buffers from model params in checkpoints I think
 - Additional logging around network health (e.g. gradient clip events, magnitudes)
 - Few more investigations around better init etc.
