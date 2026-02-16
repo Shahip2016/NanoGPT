@@ -66,8 +66,16 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.rope = getattr(config, 'rope', False)
+        self.n_kv_heads = getattr(config, 'n_kv_heads', self.n_head)
+        self.n_groups = self.n_head // self.n_kv_heads
+        self.kv_dim = (self.n_embd // self.n_head) * self.n_kv_heads
+        
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * self.kv_dim, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -89,13 +97,19 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = self.c_attn(x).split([self.n_embd, self.kv_dim, self.kv_dim], dim=2)
+        
+        k = k.view(B, T, self.n_kv_heads, C // self.n_head).transpose(1, 2) # (B, n_kv, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_kv_heads, C // self.n_head).transpose(1, 2) # (B, n_kv, T, hs)
 
         if self.rope and freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+
+        # repeat kv heads if n_kv_heads < n_head (GQA)
+        if self.n_kv_heads != self.n_head:
+            k = k.repeat_interleave(self.n_groups, dim=1)
+            v = v.repeat_interleave(self.n_groups, dim=1)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -163,6 +177,7 @@ class GPTConfig:
     rmsnorm: bool = False
     swiglu: bool = False
     rope: bool = False
+    n_kv_heads: int = None # None: default to n_head (Standard MHA)
 
 class GPT(nn.Module):
 
