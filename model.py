@@ -26,6 +26,19 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RMSNorm(nn.Module):
+    """ Root Mean Square Layer Normalization (RMSNorm) """
+
+    def __init__(self, ndim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.eps = eps
+
+    def forward(self, x):
+        norm_x = x.pow(2).mean(-1, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_x + self.eps)
+        return self.weight * x_normed
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -83,10 +96,16 @@ class MLP(nn.Module):
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.swiglu  = getattr(config, 'swiglu', False)
+        if self.swiglu:
+            self.w3 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
+        if self.swiglu:
+            x = F.silu(self.c_fc(x)) * self.w3(x)
+        else:
+            x = self.c_fc(x)
+            x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -95,9 +114,10 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        norm_cls = RMSNorm if getattr(config, 'rmsnorm', False) else LayerNorm
+        self.ln_1 = norm_cls(config.n_embd, bias=config.bias) if norm_cls == LayerNorm else norm_cls(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = norm_cls(config.n_embd, bias=config.bias) if norm_cls == LayerNorm else norm_cls(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -114,6 +134,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rmsnorm: bool = False
+    swiglu: bool = False
 
 class GPT(nn.Module):
 
