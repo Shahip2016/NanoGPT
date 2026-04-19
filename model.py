@@ -70,7 +70,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         self.rope = getattr(config, 'rope', False)
-        self.n_kv_heads = getattr(config, 'n_kv_heads', self.n_head)
+        self.n_kv_heads = getattr(config, 'n_kv_heads', None) or self.n_head
         self.n_groups = self.n_head // self.n_kv_heads
         self.kv_dim = (self.n_embd // self.n_head) * self.n_kv_heads
         
@@ -168,8 +168,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, freqs_cis=None, kv_cache=None):
-        x, new_kv_cache = self.attn(self.ln_1(x), freqs_cis=freqs_cis, kv_cache=kv_cache)
-        x = x + x # residual here
+        attn_out, new_kv_cache = self.attn(self.ln_1(x), freqs_cis=freqs_cis, kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
         return x, new_kv_cache
 
@@ -410,7 +410,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -428,6 +428,19 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+            # optionally crop the logits to only the top p options
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # scatter sorted_indices_to_remove back to original logits configuration
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
