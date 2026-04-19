@@ -252,6 +252,52 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def profile(self):
+        """
+        Print a detailed breakdown of parameters and estimated FLOPs for the model.
+        FLOPs estimate follows the PaLM paper: 2 * params per token + attention complexity.
+        """
+        print("\n" + "="*80)
+        print(f"{'Layer Name':<45} | {'Params (M)':<15} | {'FLOPs (G)':<15}")
+        print("-" * 80)
+        
+        total_params = 0
+        total_flops = 0
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        
+        def report(name, p, f):
+            nonlocal total_params, total_flops
+            print(f"{name:<45} | {p/1e6:<15.4f} | {f/1e9:<15.4f}")
+            total_params += p
+            total_flops += f
+
+        # Token Embeddings
+        report("transformer.wte", self.transformer.wte.weight.numel(), 0)
+        
+        # Position Embeddings
+        if self.transformer.wpe is not None:
+            report("transformer.wpe", self.transformer.wpe.weight.numel(), 0)
+            
+        # Blocks
+        for i, block in enumerate(self.transformer.h):
+            p_block = sum(p.numel() for p in block.parameters())
+            # Forward pass FLOPs: 2 * params * sequence_length + attention quadratic part
+            # Attention part: 2 * n_heads * head_size * seq_len^2 = 2 * n_embd * seq_len^2
+            f_block = 2 * p_block * T + 2 * cfg.n_embd * T**2
+            report(f"transformer.h.{i}", p_block, f_block)
+            
+        # Final Norm & Head
+        p_ln = sum(p.numel() for p in self.transformer.ln_f.parameters())
+        report("transformer.ln_f", p_ln, 2 * p_ln * T)
+        
+        p_head = self.lm_head.weight.numel()
+        report("lm_head", p_head, 2 * p_head * T)
+        
+        print("-" * 80)
+        print(f"{'TOTAL':<45} | {total_params/1e6:<15.4f} | {total_flops/1e9:<15.4f}")
+        print("="*80 + "\n")
+
     def forward(self, idx, targets=None, kv_caches=None):
         device = idx.device
         b, t = idx.size()
