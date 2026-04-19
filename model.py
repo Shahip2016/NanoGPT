@@ -161,6 +161,7 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         norm_cls = RMSNorm if getattr(config, 'rmsnorm', False) else LayerNorm
         self.ln_1 = norm_cls(config.n_embd, bias=config.bias) if norm_cls == LayerNorm else norm_cls(config.n_embd)
         self.attn = CausalSelfAttention(config)
@@ -168,9 +169,14 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, freqs_cis=None, kv_cache=None):
-        attn_out, new_kv_cache = self.attn(self.ln_1(x), freqs_cis=freqs_cis, kv_cache=kv_cache)
-        x = x + attn_out
-        x = x + self.mlp(self.ln_2(x))
+        if getattr(self.config, 'parallel_block', False):
+            attn_out, new_kv_cache = self.attn(self.ln_1(x), freqs_cis=freqs_cis, kv_cache=kv_cache)
+            mlp_out = self.mlp(self.ln_2(x))
+            x = x + attn_out + mlp_out
+        else:
+            attn_out, new_kv_cache = self.attn(self.ln_1(x), freqs_cis=freqs_cis, kv_cache=kv_cache)
+            x = x + attn_out
+            x = x + self.mlp(self.ln_2(x))
         return x, new_kv_cache
 
 @dataclass
@@ -187,6 +193,7 @@ class GPTConfig:
     rope: bool = False
     n_kv_heads: int = None # None: default to n_head (Standard MHA)
     gradient_checkpointing: bool = False
+    parallel_block: bool = False
 
 class GPT(nn.Module):
 
